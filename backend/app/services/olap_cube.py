@@ -7,6 +7,7 @@ import time
 import uuid
 from typing import Any
 
+from app.services import cache_eviction
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -82,20 +83,47 @@ class OlapCubeService(BaseModuleService):
         }
 
     def refresh_cube(self, cube_id: int) -> dict[str, Any]:
-        """刷新立方：淘汰旧 cache、重建、刷新依赖集市。"""
+        """刷新立方：按统一淘汰清单归档旧版本缓存、重建、刷新依赖集市。"""
         cube = store.find(self.MODULE, cube_id)
         if cube is None:
             return {"ok": False, "message": "立方不存在"}
 
-        # 淘汰旧缓存
-        _evict_cube_cache(cube_id)
+        # 开清单：按当前立方版本核验依赖条目与影响范围
+        manifest = cache_eviction.begin_refresh(cube_id)
+        history = manifest.finished_at is not None
 
-        # 重新构建
-        result = self.build_cube(cube_id)
+        # 构建新版本；版本号只在这里推进，归档范围始终由清单版本固定
+        original_version = cube.get("立方版本")
+        cube["立方版本"] = cache_eviction.next_cube_version(manifest.cube_version)
+        try:
+            result = self.build_cube(cube_id)
+
+            # 同一清单可被手工淘汰并入；释放回执写回刷新清单。
+            # 已结束的清单只复用核验结果：重复提交不再产生第二次淘汰。
+            receipt = (
+                _history_receipt(manifest)
+                if history
+                else cache_eviction.evict_for_refresh(manifest)
+            )
+        except Exception:
+            cube["立方版本"] = original_version
+            raise
+        finally:
+            cache_eviction.finish_refresh(manifest)
 
         # 更新数据集市（如果存在依赖）
         _refresh_dependent_marts(cube_id)
 
+        result["cube_version"] = cube["立方版本"]
+        result["eviction"] = {
+            "manifest_id": manifest.manifest_id,
+            "evicted_count": receipt["evicted_count"],
+            "deferred_count": receipt["deferred_count"],
+            "skipped_count": receipt["skipped_count"],
+            "entries": receipt["entries"][:10],
+            "receipt_id": receipt["receipt_id"],
+            "released_by_others": receipt["released_by_others"],
+        }
         return result
 
     def estimate_partition_cost(
@@ -139,6 +167,33 @@ class OlapCubeService(BaseModuleService):
 
 
 # ---------- 跨模块辅助函数 ----------
+
+def _history_receipt(manifest: cache_eviction.EvictionManifest) -> dict[str, Any]:
+    """已结束清单的回执：只报此前由刷新入口释放的条目，不重新淘汰。"""
+    released = [
+        {
+            "type": item.module,
+            "id": item.entry_id,
+            ("配置编号" if item.module == "aggregate_cache" else "条目编号"): item.entry_no,
+        }
+        for item in manifest.entries.values()
+        if item.released_by == cache_eviction.OWNER_REFRESH
+    ]
+    return {
+        "receipt_id": None,
+        "owner": cache_eviction.OWNER_REFRESH,
+        "manifest_id": manifest.manifest_id,
+        "evicted_count": len(released),
+        "entries": released,
+        "deferred_count": 0,
+        "deferred": [],
+        "skipped_count": 0,
+        "skipped": [],
+        "released_by_others": cache_eviction.released_by_others(manifest),
+        "complete": True,
+        "replayed": True,
+    }
+
 
 def _get_models_for_cube(dims: list[str]) -> list[dict[str, Any]]:
     models = store.rows("semantic_model")
@@ -206,6 +261,8 @@ def _write_aggregate_cache(
         "id": cache_id,
         "配置编号": f"AGGR-C{cube_id:04d}",
         "目标立方": f"olap_cube:{cube_id}",
+        "依赖立方": str(cube_id),
+        "依赖版本": cache_eviction.current_cube_version(store.find("olap_cube", cube_id)),
         "缓存粒度": f"{len(dims)}维 x {len(measures)}度",
         "TTL秒数": "3600",
         "预热策略": "LAZY",
@@ -228,6 +285,8 @@ def _write_result_cache(cube_id: int, data: list[dict[str, Any]]) -> None:
         "id": cache_id,
         "条目编号": f"RESU-C{cube_id:04d}",
         "查询摘要": f"cube_build_{cube_id}",
+        "依赖立方": str(cube_id),
+        "依赖版本": cache_eviction.current_cube_version(store.find("olap_cube", cube_id)),
         "结果哈希": hashlib.md5(data_str.encode()).hexdigest()[:12],
         "缓存命中": str(len(data)),
         "过期时间": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + 7200)),
@@ -269,21 +328,6 @@ def _update_metrics(cube_id: int, measures: list[str], data: list[dict[str, Any]
         if m.get("依赖立方", "").find(str(cube_id)) >= 0:
             m["最后产出"] = time.strftime("%Y-%m-%d %H:%M:%S")
             m["status"] = "已产出"
-
-
-def _evict_cube_cache(cube_id: int) -> None:
-    """淘汰与立方相关的所有缓存条目。"""
-    # 淘汰 aggregate_cache
-    agg = store.rows("aggregate_cache")
-    for a in agg:
-        if str(cube_id) in str(a.get("目标立方", "")):
-            a["status"] = "淘汰中"
-
-    # 淘汰 result_cache
-    result = store.rows("result_cache")
-    for r in result:
-        if str(cube_id) in str(r.get("查询摘要", "")):
-            r["status"] = "已淘汰"
 
 
 def _refresh_dependent_marts(cube_id: int) -> None:

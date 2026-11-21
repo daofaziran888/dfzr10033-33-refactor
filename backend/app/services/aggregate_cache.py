@@ -6,6 +6,7 @@ import time
 import uuid
 from typing import Any
 
+from app.services import cache_eviction
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -32,7 +33,7 @@ class AggregateCacheService(BaseModuleService):
         for cache_entry in cache_rows:
             if cache_entry.get("status") != "生效中":
                 continue
-            if str(cube_id) not in str(cache_entry.get("目标立方", "")):
+            if not cache_eviction.entry_matches_cube(self.MODULE, cache_entry, cube_id):
                 continue
 
             # 检查缓存是否过期
@@ -90,6 +91,8 @@ class AggregateCacheService(BaseModuleService):
             "id": cache_id,
             "配置编号": f"AGGR-PW{cube_id:04d}",
             "目标立方": f"olap_cube:{cube_id}",
+            "依赖立方": str(cube_id),
+            "依赖版本": cache_eviction.current_cube_version(cube),
             "缓存粒度": f"{len(dims)}维 x {len(meas)}度",
             "TTL秒数": "7200",
             "预热策略": "EAGER",
@@ -110,6 +113,8 @@ class AggregateCacheService(BaseModuleService):
             "id": result_id,
             "条目编号": f"RESU-PW{cube_id:04d}",
             "查询摘要": f"prewarm_cube_{cube_id}",
+            "依赖立方": str(cube_id),
+            "依赖版本": cache_eviction.current_cube_version(cube),
             "结果哈希": hashlib.md5(data_str.encode()).hexdigest()[:12],
             "缓存命中": "0",
             "过期时间": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + 7200)),
@@ -132,44 +137,28 @@ class AggregateCacheService(BaseModuleService):
         }
 
     def evict_stale_cache(self, cube_id: int) -> dict[str, Any]:
-        """淘汰与指定立方相关的过期 aggregate_cache 和 result_cache 条目。"""
-        evicted = []
-
-        # 淘汰 aggregate_cache
-        agg_rows = store.rows(self.MODULE)
-        for entry in agg_rows:
-            if str(cube_id) in str(entry.get("目标立方", "")):
-                if entry.get("status") in ("生效中", "草稿"):
-                    entry["status"] = "淘汰中"
-                    entry["abnormal"] = True
-                    evicted.append({
-                        "type": "aggregate_cache",
-                        "id": entry["id"],
-                        "配置编号": entry.get("配置编号"),
-                    })
-
-        # 淘汰 result_cache
-        result_rows = store.rows("result_cache")
-        for entry in result_rows:
-            if f"cube_{cube_id}" in str(entry.get("查询摘要", "")) and entry.get("status") == "有效":
-                entry["status"] = "已过期"
-                evicted.append({
-                    "type": "result_cache",
-                    "id": entry["id"],
-                    "条目编号": entry.get("条目编号"),
-                })
+        """手工淘汰：并入立方刷新清单，或按当前版本独立开清单。"""
+        receipt = cache_eviction.evict_for_manual(cube_id)
+        total = receipt["evicted_count"]
 
         # 检查数据新鲜度并通知
-        _check_freshness_after_eviction(cube_id, len(evicted))
+        _check_freshness_after_eviction(cube_id, total)
 
         # 写入审计
-        _audit_cache_eviction(cube_id, len(evicted))
+        _audit_cache_eviction(cube_id, total)
 
         return {
             "ok": True,
             "cube_id": cube_id,
-            "evicted_count": len(evicted),
-            "entries": evicted[:10],
+            "cube_version": receipt["cube_version"],
+            "evicted_count": total,
+            "entries": receipt["entries"][:10],
+            "manifest_id": receipt["manifest_id"],
+            "receipt_id": receipt["receipt_id"],
+            "deferred_count": receipt["deferred_count"],
+            "deferred": receipt["deferred"][:10],
+            "skipped_count": receipt["skipped_count"],
+            "released_by_others": receipt["released_by_others"],
         }
 
 
